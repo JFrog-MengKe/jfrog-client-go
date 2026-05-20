@@ -186,6 +186,7 @@ func (jc *HttpClient) doRequest(req *http.Request, content []byte, followRedirec
 	addUberTraceIdHeaderIfSet(req)
 
 	client := jc.client
+	forwardRedirectHeaders := redirectForwardHeaderEnabled()
 
 	if !followRedirect || (followRedirect && req.Method == http.MethodPost) {
 		// The jc.client is a shared resource between go routines, so to handle this override we clone it.
@@ -194,6 +195,9 @@ func (jc *HttpClient) doRequest(req *http.Request, content []byte, followRedirec
 			redirectUrl = req.URL.String()
 			return errors.New("redirect")
 		}
+	} else if followRedirect && forwardRedirectHeaders {
+		client = cloneHttpClient(jc.client)
+		client.CheckRedirect = allowlistCheckRedirect(httpClientsDetails)
 	}
 
 	resp, err = client.Do(req) // #nosec G704 -- CLI/library; URL from user/config, runs in user environment
@@ -206,7 +210,12 @@ func (jc *HttpClient) doRequest(req *http.Request, content []byte, followRedirec
 		// for POST requests. We therefore implement the redirect on our own.
 		if req.Method == http.MethodPost {
 			log.Debug("HTTP redirecting to", redirectUrl)
-			resp, respBody, err = jc.SendPost(redirectUrl, content, httpClientsDetails, "")
+			postDetails := httpClientsDetails
+			if forwardRedirectHeaders && !isHostInAllowlist(hostFromRedirectURL(redirectUrl), redirectAllowedHosts()) {
+				postDetails = httpClientsDetailsWithoutCredentials(httpClientsDetails)
+			}
+			// Honor closeBody from the original call (e.g. SendPostLeaveBodyOpen for AQL streaming).
+			resp, respBody, _, err = jc.Send(http.MethodPost, redirectUrl, content, true, closeBody, postDetails, "")
 			redirectUrl = ""
 			return
 		}
@@ -345,6 +354,10 @@ func (jc *HttpClient) UploadFileFromReader(reader io.Reader, url string, httpCli
 	addUserAgentHeader(req)
 
 	client := jc.client
+	if redirectForwardHeaderEnabled() {
+		client = cloneHttpClient(jc.client)
+		client.CheckRedirect = allowlistCheckRedirect(httpClientsDetails)
+	}
 	resp, err = client.Do(req) // #nosec G704 -- CLI/library; URL from user/config, runs in user environment
 	if errorutils.CheckError(err) != nil || resp == nil {
 		return
